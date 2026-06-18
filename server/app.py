@@ -36,14 +36,25 @@ from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.routing import Mount
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 import uvicorn
 
-class PostgresConnectionMiddleware(BaseHTTPMiddleware):
-    """Middleware to extract PostgreSQL connection string from headers and store in MCP state."""
+class PostgresConnectionMiddleware:
+    """Middleware to extract PostgreSQL connection string from headers and store in MCP state.
+    This middleware is ASGI-compliant and properly handles streaming responses like SSE.
+    """
 
-    async def dispatch(self, request: Request, call_next):
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Create a request object for header access
+        request = Request(scope, receive=None)
+
         # Log ALL incoming requests for debugging
         logger.info("===== INCOMING REQUEST =====")
         logger.info("Method: %s", request.method)
@@ -78,9 +89,17 @@ class PostgresConnectionMiddleware(BaseHTTPMiddleware):
         else:
             logger.warning("✗ No PostgreSQL connection details found in headers")
 
-        response = await call_next(request)
-        logger.info("===== REQUEST COMPLETED =====\n")
-        return response
+        # Use a wrapper to log completion without interfering with streaming
+        async def send_wrapper(message):
+            if message.get("type") == "http.response.body" and not message.get("more_body"):
+                logger.info("===== REQUEST COMPLETED =====\n")
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as e:
+            logger.error("Error in request processing: %s", e)
+            raise
 
 @asynccontextmanager
 async def starlette_lifespan(app):
